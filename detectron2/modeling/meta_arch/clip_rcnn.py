@@ -25,6 +25,7 @@ import copy
 from ..backbone.fpn import build_resnet_fpn_backbone
 from ..backbone.clip_backbone import build_clip_language_encoder
 from detectron2.utils.comm import gather_tensors, MILCrossEntropy
+from detectron2.structures.boxes import Boxes
 
 __all__ = ["CLIPFastRCNN", "PretrainFastRCNN"]
 
@@ -55,6 +56,7 @@ class CLIPFastRCNN(nn.Module):
         offline_input_format: Optional[str] = None,
         offline_pixel_mean: Tuple[float],
         offline_pixel_std: Tuple[float],
+        proposal_manual_scale: float
     ):
         """
         Args:
@@ -72,6 +74,7 @@ class CLIPFastRCNN(nn.Module):
         self.lang_encoder = language_encoder
         self.offline_proposal_generator = offline_proposal_generator
         self.roi_heads = roi_heads
+        self.proposal_manual_scale = proposal_manual_scale 
 
         self.input_format = input_format
         self.vis_period = vis_period
@@ -161,11 +164,33 @@ class CLIPFastRCNN(nn.Module):
             "offline_input_format": offline_cfg.INPUT.FORMAT if offline_cfg else None,
             "offline_pixel_mean": offline_cfg.MODEL.PIXEL_MEAN if offline_cfg else None,
             "offline_pixel_std": offline_cfg.MODEL.PIXEL_STD if offline_cfg else None,
+            "proposal_manual_scale" : cfg.MODEL.CLIP.BOX_SCALE
         }
 
     @property
     def device(self):
         return self.pixel_mean.device
+
+    def _scale_gt_box(self, boxes, scale: int, image_size: Tuple[int, int]):
+        """
+        Args:
+            boxes: tensor
+            scale: int
+            image_size : Tuple[int, int]
+        """
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        ctr_x = boxes[:, 0] + 0.5 * widths
+        ctr_y = boxes[:, 1] + 0.5 * heights
+
+        x1 = ctr_x - 0.5 * widths * scale
+        y1 = ctr_y - 0.5 * heights * scale
+        x2 = ctr_x + 0.5 * widths * scale
+        y2 = ctr_y + 0.5 * heights + scale
+        scaled_boxes = Boxes(torch.stack((x1, y1, x2, y2), dim=-1))
+        scaled_boxes.clip(image_size)
+        return scaled_boxes
+            
 
     def forward(self, batched_inputs: List[Dict[str, torch.Tensor]]):
         """
@@ -213,7 +238,8 @@ class CLIPFastRCNN(nn.Module):
                 images = self.offline_preprocess_image(batched_inputs)
                 features = self.offline_backbone(images.tensor)
                 if self.offline_proposal_generator is not None:
-                    proposals, _ = self.offline_proposal_generator(images, features, None)     
+                    proposals, _ = self.offline_proposal_generator(images, features, None) 
+   
 
         # recognition branch: get 2D feature maps using the backbone of recognition branch
         images = self.preprocess_image(batched_inputs)
@@ -270,7 +296,14 @@ class CLIPFastRCNN(nn.Module):
             proposals = []
             for r_i, b_input in enumerate(batched_inputs): 
                 this_gt = copy.deepcopy(b_input["instances"])  # Instance
-                gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
+                # import ipdb
+                # ipdb.set_trace()
+                if self.proposal_manual_scale != 1:
+                    gt_boxes = this_gt._fields['gt_boxes']
+                    image_size = (b_input["image"].shape[-2], b_input["image"].shape[-1])
+                    gt_boxes = self._scale_gt_box(gt_boxes.tensor, self.proposal_manual_scale, image_size).to(self.device)
+                else: 
+                    gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
                 this_gt._fields = {'proposal_boxes': gt_boxes} #, 'objectness_logits': None}
                 proposals.append(this_gt)                
         elif self.clip_crop_region_type == "RPN": # from the backbone & RPN of standard Mask-RCNN, trained on base classes
@@ -279,7 +312,7 @@ class CLIPFastRCNN(nn.Module):
             if detected_instances is None:
                 if self.offline_proposal_generator is not None:
                     proposals, _ = self.offline_proposal_generator(images, features, None)     
-    
+         
         # recognition branch: get 2D feature maps using the backbone of recognition branch
         images = self.preprocess_image(batched_inputs)
         features = self.backbone(images.tensor)

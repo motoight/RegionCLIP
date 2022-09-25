@@ -234,6 +234,9 @@ _C.MODEL.CLIP.TEXT_EMB_DIM = 1024 # the dimension of precomputed class embedding
 _C.INPUT_DIR = "./datasets/custom_images" # the folder that includes the images for region feature extraction
 _C.MODEL.CLIP.GET_CONCEPT_EMB = False # if True (extract concept embedding), a language encoder will be created
 
+# custom configuration
+_C.MODEL.CLIP.BOX_SCALE = 1.0 # whether scale up the proposal box
+_C.MODEL.CLIP.RPN_ALPHA = -1.0
 # ---------------------------------------------------------------------------- #
 # Backbone options
 # ---------------------------------------------------------------------------- #

@@ -395,7 +395,7 @@ class FastRCNNOutputLayers(nn.Module):
         clip_cls_emb: tuple = (False, None),
         no_box_delta: bool = False,
         bg_cls_loss_weight: None,
-        multiply_rpn_score: tuple = (False, False),
+        multiply_rpn_score: tuple = (False, False, 0.5),
         openset_test: None,
     ):
         """
@@ -496,6 +496,7 @@ class FastRCNNOutputLayers(nn.Module):
         self.no_box_delta = no_box_delta  # box delta after regression
         self.multiply_rpn_score = multiply_rpn_score[0]
         self.vis = multiply_rpn_score[1] # if enabled, visualize scores before multiplying RPN scores
+        self.rpn_alpha = multiply_rpn_score[2] # if set -1, use geometric mean, else using \alpha * objectness + (1-\alpha) * cls_score
         
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -521,7 +522,7 @@ class FastRCNNOutputLayers(nn.Module):
             "clip_cls_emb"          : (cfg.MODEL.CLIP.USE_TEXT_EMB_CLASSIFIER, cfg.MODEL.CLIP.TEXT_EMB_PATH, cfg.MODEL.ROI_HEADS.NAME, cfg.MODEL.CLIP.TEXT_EMB_DIM),
             "no_box_delta"          : cfg.MODEL.CLIP.NO_BOX_DELTA or cfg.MODEL.CLIP.CROP_REGION_TYPE == 'GT',
             "bg_cls_loss_weight"    : cfg.MODEL.CLIP.BG_CLS_LOSS_WEIGHT,
-            "multiply_rpn_score"    : (cfg.MODEL.CLIP.MULTIPLY_RPN_SCORE, cfg.MODEL.CLIP.VIS),
+            "multiply_rpn_score"    : (cfg.MODEL.CLIP.MULTIPLY_RPN_SCORE, cfg.MODEL.CLIP.VIS, cfg.MODEL.CLIP.RPN_ALPHA),
             "openset_test"          : (cfg.MODEL.CLIP.OPENSET_TEST_NUM_CLASSES, cfg.MODEL.CLIP.OPENSET_TEST_TEXT_EMB_PATH, \
                                        cfg.MODEL.CLIP.CLSS_TEMP, cfg.MODEL.CLIP.FOCAL_SCALED_LOSS)
             # fmt: on
@@ -708,7 +709,11 @@ class FastRCNNOutputLayers(nn.Module):
         scores_bf_multiply = scores  # as a backup for visualization purpose
         if self.multiply_rpn_score and not self.training:
             rpn_scores = [p.get('objectness_logits') for p in proposals]
-            scores = [(s * rpn_s[:, None]) ** 0.5 for s, rpn_s in zip(scores, rpn_scores)]
+            if self.rpn_alpha==-1:
+                scores = [(s * rpn_s[:, None]) ** 0.5 for s, rpn_s in zip(scores, rpn_scores)]
+            else:
+                scores = [(1-self.rpn_alpha)*s + self.rpn_alpha*rpn_s[:, None] 
+                            for s, rpn_s in zip(scores, rpn_scores)] 
         return fast_rcnn_inference(
             boxes,
             scores,
