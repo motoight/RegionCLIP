@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+from sqlite3 import adapters
 from .config import CfgNode as CN
 
 # -----------------------------------------------------------------------------
@@ -237,6 +238,15 @@ _C.MODEL.CLIP.GET_CONCEPT_EMB = False # if True (extract concept embedding), a l
 # custom configuration
 _C.MODEL.CLIP.BOX_SCALE = 1.0 # whether scale up the proposal box
 _C.MODEL.CLIP.RPN_ALPHA = -1.0
+_C.MODEL.CLIP.SIGMOID_ON_RPN_SCORE = False # whether use sigmoid score on rpn
+# _C.MODEL.CLIP.ADD_GT_IN_PROPOSAL = False # whether add gt in proposal in base set training
+# several type of ATTN_POOL_TYPE
+# 1: local mean feature as query
+# 2: global mean feature as query
+# 3: local + global feature as query 
+_C.MODEL.CLIP.ATTN_POOL_TYPE = 1
+_C.MODEL.CLIP.REGION_ADAPTER = False 
+_C.MODEL.CLIP.LEARNABLE_BG_EMB = False
 # ---------------------------------------------------------------------------- #
 # Backbone options
 # ---------------------------------------------------------------------------- #
@@ -740,7 +750,7 @@ _C.SEED = -1
 _C.CUDNN_BENCHMARK = False
 # The period (in terms of steps) for minibatch visualization at train time.
 # Set to 0 to disable.
-_C.VIS_PERIOD = 0
+_C.VIS_PERIOD = 100
 
 # global config is for quick hack purposes.
 # You can set them in command line or config files,

@@ -24,6 +24,21 @@ from .mask_head import build_mask_head
 
 from .roi_heads import ROI_HEADS_REGISTRY, select_foreground_proposals, ROIHeads
 
+
+class Adapter(nn.Module):
+    def __init__(self, c_in, reduction=4):
+        super(Adapter, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(c_in, c_in // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c_in // reduction, c_in, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.fc(x)
+        return x
+
 @ROI_HEADS_REGISTRY.register()
 class CLIPRes5ROIHeads(ROIHeads):
     """
@@ -40,6 +55,8 @@ class CLIPRes5ROIHeads(ROIHeads):
         res5: None,
         box_predictor: nn.Module,
         mask_head: Optional[nn.Module] = None,
+        attn_pool_type: int = 1,
+        adapter: False,
         **kwargs,
     ):
         """
@@ -63,7 +80,12 @@ class CLIPRes5ROIHeads(ROIHeads):
         #     res5 = nn.Sequential(*res5)
         self.res5 = res5  #  None, this head uses the res5 from backbone
         self.box_predictor = box_predictor
+        self.attn_pool_type = attn_pool_type
         self.mask_on = mask_head is not None
+        if adapter:
+            self.adapter = Adapter(1024, 4)
+        else:
+            self.adapter = None
         if self.mask_on:
             self.mask_head = mask_head
 
@@ -101,6 +123,8 @@ class CLIPRes5ROIHeads(ROIHeads):
         ret["box_predictor"] = FastRCNNOutputLayers(
             cfg, ShapeSpec(channels=out_channels, height=1, width=1)
         )
+        ret["attn_pool_type"] = cfg.MODEL.CLIP.ATTN_POOL_TYPE
+        ret["adapter"] = cfg.MODEL.CLIP.REGION_ADAPTER
 
         if mask_on:
             ret["mask_head"] = build_mask_head(
@@ -111,7 +135,10 @@ class CLIPRes5ROIHeads(ROIHeads):
 
     def _shared_roi_transform(self, features, boxes, backbone_res5):
         x = self.pooler(features, boxes)
-        return backbone_res5(x)
+        if backbone_res5 is None:
+            return x
+        else:
+            return backbone_res5(x)
 
     def forward(self, images, features, proposals, targets=None, res5=None, attnpool=None):
         """
@@ -125,11 +152,37 @@ class CLIPRes5ROIHeads(ROIHeads):
         del targets
 
         proposal_boxes = [x.proposal_boxes for x in proposals]
+
         box_features = self._shared_roi_transform(
             [features[f] for f in self.in_features], proposal_boxes, res5
         )
+
+        # assert torch.isfinite(features['res4']).all(), 'nan in res4 feature'
+
+        # global fea for attn pooling
+        global_feas = None
+        if self.attn_pool_type !=1: 
+            global_feas = features['global_emb'] # 1*N*C
+            global_feas = torch.cat([global_feas[:,i,:].unsqueeze(0).expand(-1, len(x.proposal_boxes), -1) 
+                        for i, x in enumerate(proposals)], dim=1) # 1*(M*N)*C
+
+        # import ipdb; ipdb.set_trace()
+        # assert torch.isfinite(box_features).all(), 'nan in box_feature'
+
         if attnpool:  # att pooling
-            att_feats = attnpool(box_features)
+            if self.attn_pool_type == 1:
+                att_feats = attnpool(box_features)
+            elif self.attn_pool_type == 2:
+                att_feats = attnpool(box_features, global_feas) 
+            elif self.attn_pool_type == 3:
+                loc_att_feats = attnpool(box_features)
+                global_att_features = attnpool(box_features, global_feas)
+                # simply add, possible more elegant implementation
+                att_feats = loc_att_feats + global_att_features
+            
+            if self.adapter:
+                att_feats = att_feats + self.adapter(att_feats) # residual adapter
+
             predictions = self.box_predictor(att_feats)
         else: # mean pooling
             predictions = self.box_predictor(box_features.mean(dim=[2, 3]))
@@ -137,6 +190,9 @@ class CLIPRes5ROIHeads(ROIHeads):
         if self.training:
             del features
             losses = self.box_predictor.losses(predictions, proposals)
+            for k, v in losses.items():
+                assert torch.isfinite(v), f"Loss Error {k}, {v}"
+                    
             if self.mask_on:
                 proposals, fg_selection_masks = select_foreground_proposals(
                     proposals, self.num_classes

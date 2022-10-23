@@ -80,9 +80,15 @@ class AttentionPool2d(nn.Module):
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
 
-    def forward(self, x):
+    def forward(self, x, global_emb=None):
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
+
+        if global_emb is None:
+            x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
+        else:
+            assert global_emb.shape[1] == x.shape[1], f'inconsist sample num in global {global_emb.shape} and x {x.shape}'
+            x = torch.cat([global_emb, x], dim=0)
+
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
         x, _ = F.multi_head_attention_forward(
             query=x, key=x, value=x,
@@ -209,8 +215,10 @@ class ModifiedResNet(Backbone):
         outputs['res3'] = x if "res3" in self._out_features else None
         x = self.layer3(x) # det2 resnet50: [1024, 50, 76]; CLIP resnet50: [1024, 14, 14]
         outputs['res4'] = x if "res4" in self._out_features else None
-        x = self.layer4(x)  if "res5" in self._out_features else x # det2 resnet50: [2048, 25, 38]; CLIP resnet50: [2048, 7, 7]
+        x = self.layer4(x) # det2 resnet50: [2048, 25, 38]; CLIP resnet50: [2048, 7, 7]
         outputs['res5'] = x if "res5" in self._out_features else None
+        
+        outputs['global_emb'] = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1).mean(dim=0, keepdim=True)  # NCHW -> (HW)NC - 1*NC
 
         if self.pool_vec:  # pool a vector representation for an image, for global image classification
             x = self.attnpool(x) # CLIP resnet50: [1024]

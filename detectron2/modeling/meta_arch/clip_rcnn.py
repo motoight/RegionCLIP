@@ -56,7 +56,7 @@ class CLIPFastRCNN(nn.Module):
         offline_input_format: Optional[str] = None,
         offline_pixel_mean: Tuple[float],
         offline_pixel_std: Tuple[float],
-        proposal_manual_scale: float
+        proposal_manual_scale: float,
     ):
         """
         Args:
@@ -164,7 +164,7 @@ class CLIPFastRCNN(nn.Module):
             "offline_input_format": offline_cfg.INPUT.FORMAT if offline_cfg else None,
             "offline_pixel_mean": offline_cfg.MODEL.PIXEL_MEAN if offline_cfg else None,
             "offline_pixel_std": offline_cfg.MODEL.PIXEL_STD if offline_cfg else None,
-            "proposal_manual_scale" : cfg.MODEL.CLIP.BOX_SCALE
+            "proposal_manual_scale" : cfg.MODEL.CLIP.BOX_SCALE,
         }
 
     @property
@@ -223,14 +223,17 @@ class CLIPFastRCNN(nn.Module):
             gt_instances = None
         
         # localization branch: offline modules to get the region proposals
+        def get_gt_as_proposals():
+            proposals = []
+            for r_i, b_input in enumerate(batched_inputs): 
+                this_gt = copy.deepcopy(b_input["instances"])  # Instance
+                gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
+                this_gt._fields = {'proposal_boxes': gt_boxes, 'objectness_logits': torch.ones(gt_boxes.tensor.size(0)).to(self.device)}
+                proposals.append(this_gt)
+            return proposals
         with torch.no_grad():  
             if self.clip_crop_region_type == "GT":  # from ground-truth
-                proposals = []
-                for r_i, b_input in enumerate(batched_inputs): 
-                    this_gt = copy.deepcopy(b_input["instances"])  # Instance
-                    gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
-                    this_gt._fields = {'proposal_boxes': gt_boxes, 'objectness_logits': torch.ones(gt_boxes.tensor.size(0)).to(self.device)}
-                    proposals.append(this_gt)                
+                proposals = get_gt_as_proposals()         
             elif self.clip_crop_region_type == "RPN": # from the backbone & RPN of standard Mask-RCNN, trained on base classes
                 if self.offline_backbone.training or self.offline_proposal_generator.training:  #  was set to True in training script
                     self.offline_backbone.eval() 
@@ -238,7 +241,8 @@ class CLIPFastRCNN(nn.Module):
                 images = self.offline_preprocess_image(batched_inputs)
                 features = self.offline_backbone(images.tensor)
                 if self.offline_proposal_generator is not None:
-                    proposals, _ = self.offline_proposal_generator(images, features, None) 
+                    proposals, _ = self.offline_proposal_generator(images, features, None)
+               
    
 
         # recognition branch: get 2D feature maps using the backbone of recognition branch
@@ -265,6 +269,41 @@ class CLIPFastRCNN(nn.Module):
         losses = {}
         losses.update(detector_losses)
         return losses
+
+    def visualize_training(self, batched_inputs, proposals):
+        """
+        A function used to visualize images and proposals. It shows ground truth
+        bounding boxes on the original image and up to 20 top-scoring predicted
+        object proposals on the original image. Users can implement different
+        visualization functions for different models.
+
+        Args:
+            batched_inputs (list): a list that contains input to the model.
+            proposals (list): a list that contains predicted proposals. Both
+                batched_inputs and proposals should have the same length.
+        """
+        from detectron2.utils.visualizer import Visualizer
+
+        storage = get_event_storage()
+        max_vis_prop = 20
+
+        for input, prop in zip(batched_inputs, proposals):
+            img = input["image"]
+            img = convert_image_to_rgb(img.permute(1, 2, 0), self.input_format)
+            v_gt = Visualizer(img, None)
+            v_gt = v_gt.overlay_instances(boxes=input["instances"].gt_boxes)
+            anno_img = v_gt.get_image()
+            box_size = min(len(prop.proposal_boxes), max_vis_prop)
+            v_pred = Visualizer(img, None)
+            v_pred = v_pred.overlay_instances(
+                boxes=prop.proposal_boxes[0:box_size].tensor.cpu().numpy()
+            )
+            prop_img = v_pred.get_image()
+            vis_img = np.concatenate((anno_img, prop_img), axis=1)
+            vis_img = vis_img.transpose(2, 0, 1)
+            vis_name = "Left: GT bounding boxes;  Right: Predicted proposals"
+            storage.put_image(vis_name, vis_img)
+            break  # only visualize one image in a batch
 
     def inference(
         self,
