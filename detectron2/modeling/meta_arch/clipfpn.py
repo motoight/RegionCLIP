@@ -27,15 +27,12 @@ from ..backbone.clip_backbone import build_clip_language_encoder
 from detectron2.utils.comm import gather_tensors, MILCrossEntropy
 from detectron2.structures.boxes import Boxes
 
-__all__ = ["CLIPFPN_RCNN"]
-
+__all__ = ["CLIPFPN"]
 
 @META_ARCH_REGISTRY.register()
-class CLIPFPN_RCNN(nn.Module):
+class CLIPFPN(nn.Module):
     """
     Fast R-CNN style where the cropping is conducted on feature maps instead of raw images.
-    Redesign its fpn and roi strategy to full utilize clip pretrain backbone.
-    Different from CLIP_FASTRCNN, we share visual backbone on fpn and detection head.
     It contains the following two components: 
     1. Localization branch: pretrained backbone+RPN or equivalent modules, and is able to output object proposals
     2. Recognition branch: is able to recognize zero-shot regions
@@ -44,9 +41,8 @@ class CLIPFPN_RCNN(nn.Module):
     def __init__(
         self,
         *,
-        offline_backbone: Backbone,
         backbone: Backbone,
-        offline_proposal_generator: nn.Module,
+        proposal_generator: nn.Module,
         language_encoder: nn.Module, 
         roi_heads: nn.Module,
         pixel_mean: Tuple[float],
@@ -54,12 +50,8 @@ class CLIPFPN_RCNN(nn.Module):
         input_format: Optional[str] = None,
         vis_period: int = 0,
         clip_crop_region_type: str = 'GT',
-        use_clip_c4: False,
         use_clip_attpool: False,
-        offline_input_format: Optional[str] = None,
-        offline_pixel_mean: Tuple[float],
-        offline_pixel_std: Tuple[float],
-        proposal_manual_scale: float,
+        eval_proposal: False
     ):
         """
         Args:
@@ -72,12 +64,10 @@ class CLIPFPN_RCNN(nn.Module):
             vis_period: the period to run visualization. Set to 0 to disable.
         """
         super().__init__()
-        self.offline_backbone = offline_backbone
         self.backbone = backbone
         self.lang_encoder = language_encoder
-        self.offline_proposal_generator = offline_proposal_generator
+        self.proposal_generator = proposal_generator
         self.roi_heads = roi_heads
-        self.proposal_manual_scale = proposal_manual_scale 
 
         self.input_format = input_format
         self.vis_period = vis_period
@@ -95,65 +85,26 @@ class CLIPFPN_RCNN(nn.Module):
             self.div_pixel = True
         else:
             self.div_pixel = False
-
-        if offline_input_format and offline_pixel_mean and offline_pixel_std:
-            self.offline_input_format = offline_input_format
-            self.register_buffer("offline_pixel_mean", torch.tensor(offline_pixel_mean).view(-1, 1, 1), False)
-            self.register_buffer("offline_pixel_std", torch.tensor(offline_pixel_std).view(-1, 1, 1), False)
-            if np.sum(offline_pixel_mean) < 3.0: # converrt pixel value to range [0.0, 1.0] by dividing 255.0
-                assert offline_input_format == 'RGB'
-                self.offline_div_pixel = True
-            else:
-                self.offline_div_pixel = False
         
         self.clip_crop_region_type = clip_crop_region_type
-        self.use_clip_c4 = use_clip_c4 # if True, use C4 mode where roi_head uses the last resnet layer from backbone 
         self.use_clip_attpool = use_clip_attpool # if True (C4+text_emb_as_classifier), use att_pool to replace default mean pool
+        self.eval_proposal_only = eval_proposal
 
     @classmethod
     def from_config(cls, cfg):
-        # create independent backbone & RPN
-        if cfg.MODEL.CLIP.CROP_REGION_TYPE == "RPN": 
-            # create offline cfg for the pretrained backbone & RPN
-            from detectron2.config import get_cfg
-            offline_cfg = get_cfg()
-            offline_cfg.merge_from_file(cfg.MODEL.CLIP.OFFLINE_RPN_CONFIG)
-            if cfg.MODEL.CLIP.OFFLINE_RPN_LSJ_PRETRAINED: # large-scale jittering (LSJ) pretrained RPN
-                offline_cfg.MODEL.BACKBONE.FREEZE_AT = 0 # make all fronzon layers to "SyncBN"
-                offline_cfg.MODEL.RESNETS.NORM = "SyncBN" # 5 resnet layers
-                offline_cfg.MODEL.FPN.NORM = "SyncBN" # fpn layers
-                offline_cfg.MODEL.RPN.CONV_DIMS = [-1, -1] # rpn layers
-            if cfg.MODEL.CLIP.OFFLINE_RPN_NMS_THRESH:
-                offline_cfg.MODEL.RPN.NMS_THRESH = cfg.MODEL.CLIP.OFFLINE_RPN_NMS_THRESH  # 0.9
-            if cfg.MODEL.CLIP.OFFLINE_RPN_POST_NMS_TOPK_TEST:
-                offline_cfg.MODEL.RPN.POST_NMS_TOPK_TEST = cfg.MODEL.CLIP.OFFLINE_RPN_POST_NMS_TOPK_TEST # 1000
-
-            # create offline backbone and RPN
-            offline_backbone = build_backbone(offline_cfg)
-            offline_rpn = build_proposal_generator(offline_cfg, offline_backbone.output_shape())
-
-            # convert to evaluation mode
-            for p in offline_backbone.parameters(): p.requires_grad = False
-            for p in offline_rpn.parameters(): p.requires_grad = False
-            offline_backbone.eval()
-            offline_rpn.eval()
-        # region proposals are ground-truth boxes
-        elif cfg.MODEL.CLIP.CROP_REGION_TYPE == "GT":
-            offline_backbone = None
-            offline_rpn = None
-            offline_cfg = None
-        
         backbone = build_backbone(cfg)
         # build language encoder
         if cfg.MODEL.CLIP.GET_CONCEPT_EMB: # extract concept embeddings
             language_encoder = build_clip_language_encoder(cfg)
         else:
             language_encoder = None
-        roi_heads = build_roi_heads(cfg, backbone.output_shape())
+        rpn = build_proposal_generator(cfg, backbone.output_shape()) # tbc: to be check
+        roi_heads = build_roi_heads(cfg, backbone.bottom_up.output_shape()) # tbc: hard code 1/2 in roipooler scales
+
 
         return {
-            "offline_backbone": offline_backbone,
-            "offline_proposal_generator": offline_rpn, 
+            "backbone": backbone,
+            "proposal_generator": rpn, 
             "backbone": backbone,
             "language_encoder": language_encoder, 
             "roi_heads": roi_heads, 
@@ -162,12 +113,8 @@ class CLIPFPN_RCNN(nn.Module):
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
             "clip_crop_region_type" : cfg.MODEL.CLIP.CROP_REGION_TYPE,
-            "use_clip_c4": cfg.MODEL.BACKBONE.NAME == "build_clip_resnet_backbone",
             "use_clip_attpool": cfg.MODEL.ROI_HEADS.NAME in ['CLIPRes5ROIHeads', 'CLIPStandardROIHeads'] and cfg.MODEL.CLIP.USE_TEXT_EMB_CLASSIFIER,
-            "offline_input_format": offline_cfg.INPUT.FORMAT if offline_cfg else None,
-            "offline_pixel_mean": offline_cfg.MODEL.PIXEL_MEAN if offline_cfg else None,
-            "offline_pixel_std": offline_cfg.MODEL.PIXEL_STD if offline_cfg else None,
-            "proposal_manual_scale" : cfg.MODEL.CLIP.BOX_SCALE,
+            "eval_proposal": cfg.MODEL.CLIP.EVAL_PROPOSAL
         }
 
     @property
@@ -226,43 +173,28 @@ class CLIPFPN_RCNN(nn.Module):
             gt_instances = None
         
         # localization branch: offline modules to get the region proposals
-        def get_gt_as_proposals():
+        images = self.preprocess_image(batched_inputs)
+        bottom_up_features = self.backbone.bottom_up(images.tensor)
+        if self.clip_crop_region_type == "GT":  # from ground-truth
             proposals = []
             for r_i, b_input in enumerate(batched_inputs): 
                 this_gt = copy.deepcopy(b_input["instances"])  # Instance
                 gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
                 this_gt._fields = {'proposal_boxes': gt_boxes, 'objectness_logits': torch.ones(gt_boxes.tensor.size(0)).to(self.device)}
                 proposals.append(this_gt)
-            return proposals
-        with torch.no_grad():  
-            if self.clip_crop_region_type == "GT":  # from ground-truth
-                proposals = get_gt_as_proposals()         
-            elif self.clip_crop_region_type == "RPN": # from the backbone & RPN of standard Mask-RCNN, trained on base classes
-                if self.offline_backbone.training or self.offline_proposal_generator.training:  #  was set to True in training script
-                    self.offline_backbone.eval() 
-                    self.offline_proposal_generator.eval()  
-                images = self.offline_preprocess_image(batched_inputs)
-                features = self.offline_backbone(images.tensor)
-                if self.offline_proposal_generator is not None:
-                    proposals, _ = self.offline_proposal_generator(images, features, None)
-               
-   
+        elif self.clip_crop_region_type == "RPN": # from trained fpn & rpn
+            fpn_features = self.backbone(images.tensor, bottom_up_features)
+            proposals, rpn_loss = self.proposal_generator(images, fpn_features, gt_instances)
 
         # recognition branch: get 2D feature maps using the backbone of recognition branch
-        images = self.preprocess_image(batched_inputs)
-        features = self.backbone(images.tensor)
+        if self.use_clip_attpool:
+            _, detector_losses = self.roi_heads(batched_inputs, bottom_up_features, proposals, gt_instances, 
+                                    res5=self.backbone.bottom_up.layer4,
+                                    attnpool=self.backbone.bottom_up.attnpool, vis_period=self.vis_period)
+        else:
+           _, detector_losses = self.roi_heads(batched_inputs, bottom_up_features, proposals, gt_instances,
+                                    vis_period=self.vis_period)
 
-        # Given the proposals, crop region features from 2D image features and classify the regions
-        if self.use_clip_c4: # use C4 + resnet weights from CLIP
-            if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances, res5=self.backbone.layer4, attnpool=self.backbone.attnpool)
-            else: # use mean pool
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances, res5=self.backbone.layer4)
-        else:  # regular detector setting
-            if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances, attnpool=self.backbone.bottom_up.attnpool)
-            else: # use mean pool
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances)
         if self.vis_period > 0:
             storage = get_event_storage()
             if storage.iter % self.vis_period == 0:
@@ -271,6 +203,7 @@ class CLIPFPN_RCNN(nn.Module):
 
         losses = {}
         losses.update(detector_losses)
+        losses.update(rpn_loss)
         return losses
 
     def visualize_training(self, batched_inputs, proposals):
@@ -334,65 +267,36 @@ class CLIPFPN_RCNN(nn.Module):
         assert not self.training
         
         # localization branch: offline modules to get the region proposals
+        images = self.preprocess_image(batched_inputs)
+        bottom_up_features = self.backbone.bottom_up(images.tensor)
         if self.clip_crop_region_type == "GT":  # from ground-truth
             proposals = []
             for r_i, b_input in enumerate(batched_inputs): 
                 this_gt = copy.deepcopy(b_input["instances"])  # Instance
-                # import ipdb
-                # ipdb.set_trace()
-                if self.proposal_manual_scale != 1:
-                    gt_boxes = this_gt._fields['gt_boxes']
-                    image_size = (b_input["image"].shape[-2], b_input["image"].shape[-1])
-                    gt_boxes = self._scale_gt_box(gt_boxes.tensor, self.proposal_manual_scale, image_size).to(self.device)
-                else: 
-                    gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
-                this_gt._fields = {'proposal_boxes': gt_boxes} #, 'objectness_logits': None}
-                proposals.append(this_gt)                
-        elif self.clip_crop_region_type == "RPN": # from the backbone & RPN of standard Mask-RCNN, trained on base classes
-            images = self.offline_preprocess_image(batched_inputs)
-            features = self.offline_backbone(images.tensor)
-            if detected_instances is None:
-                if self.offline_proposal_generator is not None:
-                    proposals, _ = self.offline_proposal_generator(images, features, None)     
-         
-        # recognition branch: get 2D feature maps using the backbone of recognition branch
-        images = self.preprocess_image(batched_inputs)
-        features = self.backbone(images.tensor)
+                gt_boxes = this_gt._fields['gt_boxes'].to(self.device)
+                this_gt._fields = {'proposal_boxes': gt_boxes, 'objectness_logits': torch.ones(gt_boxes.tensor.size(0)).to(self.device)}
+                proposals.append(this_gt)
+        elif self.clip_crop_region_type == "RPN": # from trained fpn & rpn
+            fpn_features = self.backbone(images.tensor, bottom_up_features)
+            proposals, _ = self.proposal_generator(images, fpn_features, None)        
 
-        # Given the proposals, crop region features from 2D image features and classify the regions
-        if self.use_clip_c4: # use C4 + resnet weights from CLIP
-            if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                results, _ = self.roi_heads(images, features, proposals, None, res5=self.backbone.layer4, attnpool=self.backbone.attnpool)
-            else: # use mean pool
-                results, _ = self.roi_heads(images, features, proposals, None, res5=self.backbone.layer4)
-        else:  # regular detector setting
-            if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                results, _  = self.roi_heads(images, features, proposals, None, attnpool=self.backbone.bottom_up.attnpool)
+        if not self.eval_proposal_only:
+            # recognition branch: get 2D feature maps using the backbone of recognition branch
+            if self.use_clip_attpool:
+                results, _ = self.roi_heads(images, bottom_up_features, proposals, None, 
+                res5=self.backbone.bottom_up.layer4,
+                attnpool=self.backbone.bottom_up.attnpool)
             else:
-                results, _  = self.roi_heads(images, features, proposals, None)
+                results, _ = self.roi_heads(images, bottom_up_features, proposals, None)
+        else:
+            results = proposals
         
         #visualize_proposals(batched_inputs, proposals, self.input_format)
         if do_postprocess:
             assert not torch.jit.is_scripting(), "Scripting is not supported for postprocess."
-            return CLIPFastRCNN._postprocess(results, batched_inputs)
+            return CLIPFPN._postprocess(results, batched_inputs, self.eval_proposal_only, proposals)
         else:
             return results
-
-    def offline_preprocess_image(self, batched_inputs: List[Dict[str, torch.Tensor]]):
-        """
-        Normalize, pad and batch the input images. Use detectron2 default processing (pixel mean & std).
-        Note: Due to FPN size_divisibility, images are padded by right/bottom border. So FPN is consistent with C4 and GT boxes.
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        if (self.input_format == 'RGB' and self.offline_input_format == 'BGR') or \
-            (self.input_format == 'BGR' and self.offline_input_format == 'RGB'):
-            images = [x[[2,1,0],:,:] for x in images]
-        if self.offline_div_pixel:
-            images = [((x / 255.0) - self.offline_pixel_mean) / self.offline_pixel_std for x in images]
-        else:
-            images = [(x - self.offline_pixel_mean) / self.offline_pixel_std for x in images]
-        images = ImageList.from_tensors(images, self.offline_backbone.size_divisibility)
-        return images
 
     def preprocess_image(self, batched_inputs: List[Dict[str, torch.Tensor]]):
         """
@@ -408,16 +312,21 @@ class CLIPFPN_RCNN(nn.Module):
         return images
 
     @staticmethod
-    def _postprocess(instances, batched_inputs: List[Dict[str, torch.Tensor]]):
+    def _postprocess(instances, batched_inputs: List[Dict[str, torch.Tensor]], isproposal, proposals):
         """
         Rescale the output instances to the target size.
         """
         # note: private function; subject to changes
         processed_results = []
-        for results_per_image, input_per_image in zip(
-            instances, batched_inputs):
+        for results_per_image, proposals_per_image, input_per_image in zip(
+            instances, proposals, batched_inputs):
             height = input_per_image["height"]  # original image size, before resizing
             width = input_per_image["width"]  # original image size, before resizing
             r = detector_postprocess(results_per_image, height, width)
-            processed_results.append({"instances": r})
+            pr = detector_postprocess(proposals_per_image, height, width)
+            if isproposal:
+                processed_results.append({"proposals": r})
+            else:
+                processed_results.append({"instances": r, "proposals": pr})
         return processed_results
+

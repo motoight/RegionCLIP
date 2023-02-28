@@ -140,15 +140,58 @@ class CLIPRes5ROIHeads(ROIHeads):
         else:
             return backbone_res5(x)
 
-    def forward(self, images, features, proposals, targets=None, res5=None, attnpool=None):
+    def _visualize_roi_training(self, batched_inputs, proposals, bg_samples=20, input_format="RGB"):
+        ''' 
+        Visualize gt, fg, and bg samples after roi sampling 
+            show all gt and fg samples, show some of bg samples.
+        '''
+        from detectron2.utils.visualizer import Visualizer
+        from detectron2.data.detection_utils import convert_image_to_rgb
+
+        _GREEN = (0, 1.0, 0)
+        _RED = (1.0, 0, 0)
+        _BLUE = (0, 0, 1.0)
+
+        storage = get_event_storage()
+
+        for input, prop in zip(batched_inputs, proposals):
+            img = input["image"]
+            img = convert_image_to_rgb(img.permute(1, 2, 0), input_format)
+            v_img = Visualizer(img, None)
+            # draw gt
+            gt_boxes = input["instances"].gt_boxes 
+            gt_colors =[_GREEN] * len(gt_boxes)
+            bg_label = max(prop.gt_classes)
+            bg_idx = (prop.gt_classes == bg_label)
+            bg_boxes = prop.proposal_boxes[bg_idx][:bg_samples]
+            bg_colors = [_BLUE] * len(bg_boxes)
+            fg_boxes = prop.proposal_boxes[~bg_idx]
+            fg_colors = [_RED] * len(fg_boxes)
+
+            all_boxes = Boxes(np.concatenate([gt_boxes.tensor, 
+                                        bg_boxes.tensor.cpu().numpy(), 
+                                        fg_boxes.tensor.cpu().numpy()], axis=0))
+            all_colors = gt_colors + bg_colors + fg_colors 
+
+            v_img = v_img.overlay_instances(boxes=all_boxes, assigned_colors=all_colors)
+            anno_img = v_img.get_image()
+            anno_img = anno_img.transpose(2, 0, 1)
+            vis_name = "gt,fg and bg"
+            storage.put_image(vis_name, anno_img)
+            break  # only visualize one image in a batch
+
+    def forward(self, batched_inputs, features, proposals, targets=None, res5=None, attnpool=None, vis_period=0):
         """
         See :meth:`ROIHeads.forward`.
         """
-        del images
-
         if self.training:
             assert targets
             proposals = self.label_and_sample_proposals(proposals, targets)
+            if vis_period>0:
+                storage = get_event_storage()
+                if storage.iter % vis_period == 0:
+                    self._visualize_roi_training(batched_inputs, proposals)
+        del batched_inputs
         del targets
 
         proposal_boxes = [x.proposal_boxes for x in proposals]
@@ -156,6 +199,7 @@ class CLIPRes5ROIHeads(ROIHeads):
         box_features = self._shared_roi_transform(
             [features[f] for f in self.in_features], proposal_boxes, res5
         )
+        # print(f"box_feature : {box_features.shape}")
 
         # assert torch.isfinite(features['res4']).all(), 'nan in res4 feature'
 
@@ -165,6 +209,7 @@ class CLIPRes5ROIHeads(ROIHeads):
             global_feas = features['global_emb'] # 1*N*C
             global_feas = torch.cat([global_feas[:,i,:].unsqueeze(0).expand(-1, len(x.proposal_boxes), -1) 
                         for i, x in enumerate(proposals)], dim=1) # 1*(M*N)*C
+            # print(f"global_feature : {global_feas.shape}")
 
         # import ipdb; ipdb.set_trace()
         # assert torch.isfinite(box_features).all(), 'nan in box_feature'
@@ -184,9 +229,9 @@ class CLIPRes5ROIHeads(ROIHeads):
                 att_feats = att_feats + self.adapter(att_feats) # residual adapter
 
             predictions = self.box_predictor(att_feats)
+            # import ipdb; ipdb.set_trace()
         else: # mean pooling
             predictions = self.box_predictor(box_features.mean(dim=[2, 3]))
-
         if self.training:
             del features
             losses = self.box_predictor.losses(predictions, proposals)

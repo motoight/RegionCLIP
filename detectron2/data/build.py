@@ -505,6 +505,7 @@ def build_detection_test_loader(dataset, *, mapper, sampler=None, num_workers=0,
         world_size = get_world_size()
         batch_size = clip_batch_size // world_size
         batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, batch_size, drop_last=False)
+        print(vars(batch_sampler.sampler))
         data_loader = torch.utils.data.DataLoader(
             dataset,
             num_workers=num_workers,

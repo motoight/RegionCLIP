@@ -247,6 +247,7 @@ _C.MODEL.CLIP.SIGMOID_ON_RPN_SCORE = False # whether use sigmoid score on rpn
 _C.MODEL.CLIP.ATTN_POOL_TYPE = 1
 _C.MODEL.CLIP.REGION_ADAPTER = False 
 _C.MODEL.CLIP.LEARNABLE_BG_EMB = False
+_C.MODEL.CLIP.EVAL_PROPOSAL = False
 # ---------------------------------------------------------------------------- #
 # Backbone options
 # ---------------------------------------------------------------------------- #

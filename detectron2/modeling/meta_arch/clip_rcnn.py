@@ -57,6 +57,7 @@ class CLIPFastRCNN(nn.Module):
         offline_pixel_mean: Tuple[float],
         offline_pixel_std: Tuple[float],
         proposal_manual_scale: float,
+        eval_proposal: False
     ):
         """
         Args:
@@ -106,6 +107,7 @@ class CLIPFastRCNN(nn.Module):
         self.clip_crop_region_type = clip_crop_region_type
         self.use_clip_c4 = use_clip_c4 # if True, use C4 mode where roi_head uses the last resnet layer from backbone 
         self.use_clip_attpool = use_clip_attpool # if True (C4+text_emb_as_classifier), use att_pool to replace default mean pool
+        self.eval_proposal_only = eval_proposal
 
     @classmethod
     def from_config(cls, cfg):
@@ -165,6 +167,7 @@ class CLIPFastRCNN(nn.Module):
             "offline_pixel_mean": offline_cfg.MODEL.PIXEL_MEAN if offline_cfg else None,
             "offline_pixel_std": offline_cfg.MODEL.PIXEL_STD if offline_cfg else None,
             "proposal_manual_scale" : cfg.MODEL.CLIP.BOX_SCALE,
+            "eval_proposal": cfg.MODEL.CLIP.EVAL_PROPOSAL
         }
 
     @property
@@ -252,14 +255,18 @@ class CLIPFastRCNN(nn.Module):
         # Given the proposals, crop region features from 2D image features and classify the regions
         if self.use_clip_c4: # use C4 + resnet weights from CLIP
             if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances, res5=self.backbone.layer4, attnpool=self.backbone.attnpool)
+                _, detector_losses = self.roi_heads(batched_inputs, features, proposals, gt_instances, res5=self.backbone.layer4, 
+                attnpool=self.backbone.attnpool, vis_period=self.vis_period)
             else: # use mean pool
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances, res5=self.backbone.layer4)
+                _, detector_losses = self.roi_heads(batched_inputs, features, proposals, gt_instances, 
+                res5=self.backbone.layer4, vis_period=self.vis_period)
         else:  # regular detector setting
             if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances, attnpool=self.backbone.bottom_up.attnpool)
+                _, detector_losses = self.roi_heads(batched_inputs, features, proposals, gt_instances, 
+                attnpool=self.backbone.bottom_up.attnpool, vis_period=self.vis_period)
             else: # use mean pool
-                _, detector_losses = self.roi_heads(images, features, proposals, gt_instances)
+                _, detector_losses = self.roi_heads(batched_inputs, features, proposals, gt_instances,
+                vis_period=self.vis_period)
         if self.vis_period > 0:
             storage = get_event_storage()
             if storage.iter % self.vis_period == 0:
@@ -352,26 +359,29 @@ class CLIPFastRCNN(nn.Module):
                 if self.offline_proposal_generator is not None:
                     proposals, _ = self.offline_proposal_generator(images, features, None)     
          
-        # recognition branch: get 2D feature maps using the backbone of recognition branch
-        images = self.preprocess_image(batched_inputs)
-        features = self.backbone(images.tensor)
+        if not self.eval_proposal_only:
+            # recognition branch: get 2D feature maps using the backbone of recognition branch
+            images = self.preprocess_image(batched_inputs)
+            features = self.backbone(images.tensor)
 
-        # Given the proposals, crop region features from 2D image features and classify the regions
-        if self.use_clip_c4: # use C4 + resnet weights from CLIP
-            if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                results, _ = self.roi_heads(images, features, proposals, None, res5=self.backbone.layer4, attnpool=self.backbone.attnpool)
-            else: # use mean pool
-                results, _ = self.roi_heads(images, features, proposals, None, res5=self.backbone.layer4)
-        else:  # regular detector setting
-            if self.use_clip_attpool: # use att_pool from CLIP to match dimension
-                results, _  = self.roi_heads(images, features, proposals, None, attnpool=self.backbone.bottom_up.attnpool)
-            else:
-                results, _  = self.roi_heads(images, features, proposals, None)
+            # Given the proposals, crop region features from 2D image features and classify the regions
+            if self.use_clip_c4: # use C4 + resnet weights from CLIP
+                if self.use_clip_attpool: # use att_pool from CLIP to match dimension
+                    results, _ = self.roi_heads(images, features, proposals, None, res5=self.backbone.layer4, attnpool=self.backbone.attnpool)
+                else: # use mean pool
+                    results, _ = self.roi_heads(images, features, proposals, None, res5=self.backbone.layer4)
+            else:  # regular detector setting
+                if self.use_clip_attpool: # use att_pool from CLIP to match dimension
+                    results, _  = self.roi_heads(images, features, proposals, None, attnpool=self.backbone.bottom_up.attnpool)
+                else:
+                    results, _  = self.roi_heads(images, features, proposals, None)
+        else:
+            results = proposals
         
         #visualize_proposals(batched_inputs, proposals, self.input_format)
         if do_postprocess:
             assert not torch.jit.is_scripting(), "Scripting is not supported for postprocess."
-            return CLIPFastRCNN._postprocess(results, batched_inputs)
+            return CLIPFastRCNN._postprocess(results, batched_inputs, self.eval_proposal_only)
         else:
             return results
 
@@ -405,7 +415,7 @@ class CLIPFastRCNN(nn.Module):
         return images
 
     @staticmethod
-    def _postprocess(instances, batched_inputs: List[Dict[str, torch.Tensor]]):
+    def _postprocess(instances, batched_inputs: List[Dict[str, torch.Tensor]], isproposal):
         """
         Rescale the output instances to the target size.
         """
@@ -416,7 +426,10 @@ class CLIPFastRCNN(nn.Module):
             height = input_per_image["height"]  # original image size, before resizing
             width = input_per_image["width"]  # original image size, before resizing
             r = detector_postprocess(results_per_image, height, width)
-            processed_results.append({"instances": r})
+            if isproposal:
+                processed_results.append({"proposals": r})
+            else:
+                processed_results.append({"instances": r})
         return processed_results
 
 @META_ARCH_REGISTRY.register()

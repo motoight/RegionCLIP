@@ -263,10 +263,16 @@ class ModifiedResNet(Backbone):
             cnnblockbase_freeze(self.conv3)
             cnnblockbase_freeze(self.bn3)
         # each stage is a torch.nn.modules.container.Sequential
-        for idx, stage in enumerate([self.layer1, self.layer2, self.layer3, self.layer4], start=2): 
-            if freeze_at >= idx:
+        for idx, stage in enumerate([self.layer1, self.layer2, self.layer3, self.layer4, self.attnpool], start=2): 
+            if freeze_at == 6:
+                for p in self.attnpool.parameters():
+                    p.requires_grad = False
+                break
+
+            if freeze_at >= idx and freeze_at:
                 for block in stage.children():  # each block is a Bottleneck
                     cnnblockbase_freeze(block)  
+        
         return self
 
     def output_shape(self):

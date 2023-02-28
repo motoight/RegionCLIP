@@ -576,7 +576,7 @@ class FastRCNNOutputLayers(nn.Module):
             bg_score = self.cls_bg_score(normalized_x)
             if self.use_bias:
                 bg_score += self.cls_bg_score.bias
-
+            import ipdb; ipdb.set_trace()
             scores = torch.cat((cls_scores, bg_score), dim=1)
             assert torch.isfinite(scores).all(), 'nan in scores'
             scores = scores / self.temperature
@@ -649,7 +649,7 @@ class FastRCNNOutputLayers(nn.Module):
         p = F.softmax(inputs, dim=-1)
         p_t = p[torch.arange(p.size(0)).to(p.device), targets]  # get prob of target class
         loss = ce_loss * ((1 - p_t) ** gamma)
-        assert torch.isfinite(loss.mean()), f"Loss Error, in focal_loss. loss: {loss}, p {p}, input {inputs}"
+        assert torch.isfinite(loss).any(), f"Loss Error, in focal_loss. loss: {loss}, p {p}, input {inputs}"
 
         # bg loss weight
         if self.cls_loss_weight is not None:

@@ -191,8 +191,6 @@ def inference_on_dataloader(model, data_loader, dataset_name, tmpdir):
     from detectron2.structures import Instances
     import pickle
     num_devices = get_world_size()
-    if num_devices>1:
-        model = model.module
     logger = logging.getLogger(__name__)
     logger.info("Start inference on {} batches".format(len(data_loader)))
     total = len(data_loader)  # inference data loader must have a fixed length
@@ -258,14 +256,13 @@ def inference_on_dataloader(model, data_loader, dataset_name, tmpdir):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             # log each 1000 iter
-            # if idx % 2000 == 0:
-            #     tmppath = '/data/tmp'
-            #     mkdir_or_exist(tmppath)
-            #     outpath = osp.join(tmppath, "{}_rpn_proposals_train{}.pkl".format(dataset_name, idx))
-            #     with open(outpath, 'wb') as ff:
-            #         pickle.dump(results, ff, protocol=2)
-            #         logger.info('save proposals on {} in {}' .format(dataset_name, outpath))  
-
+            if idx % 2000 == 0:
+                tmppath = '/data/tmp'
+                mkdir_or_exist(tmppath)
+                outpath = osp.join(tmppath, "{}_rpn_proposals_train{}.pkl".format(dataset_name, idx))
+                with open(outpath, 'wb') as ff:
+                    pickle.dump(results, ff, protocol=2)
+                    logger.info('save proposals on {} in {}' .format(dataset_name, outpath))  
             total_compute_time += time.perf_counter() - start_compute_time
 
             start_eval_time = time.perf_counter()
@@ -360,10 +357,8 @@ def collect_results_cpu(result_part, size, tmpdir=None):
                 part_list.append(pickle.load(ff))
         # sort the results
         ordered_results = []
-        # for res in zip(*part_list):
-        #     ordered_results.extend(list(res))
-        for part in part_list:
-            ordered_results.extend(part)
+        for res in zip(*part_list):
+            ordered_results.extend(list(res))
         # the dataloader may pad some samples
         ordered_results = ordered_results[:size]
         # remove tmp dir
@@ -374,10 +369,6 @@ def collect_results_cpu(result_part, size, tmpdir=None):
 
 def do_forward(cfg, model, outdir='/data/detpro/proposals', tmpdir='/data/detpro/tmp'):
     import pickle
-    # load from ckpt
-    DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=False)
-            
     model.eval()
     logger = logging.getLogger(__name__)
     # build dataset
@@ -387,7 +378,7 @@ def do_forward(cfg, model, outdir='/data/detpro/proposals', tmpdir='/data/detpro
         data_loader = build_detection_test_loader(cfg, dataset_name, clip_batch_size = clip_batchsize)
         results = inference_on_dataloader(model, data_loader, dataset_name, tmpdir)
         mkdir_or_exist(outdir)
-        outpath = osp.join(outdir, dataset_name, 'rpn_proposals_train.pkl')
+        outpath = osp.join(outdir, '{}_rpn_proposals_train.pkl'.format(dataset_name))
         with open(outpath, 'wb') as ff:
             pickle.dump(results, ff, protocol=2)
         logger.info('save all proposals on {} in {}' .format(dataset_name, outpath))    
@@ -418,7 +409,9 @@ def main(args):
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
         return do_test(cfg, model)
-   
+
+    DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS, resume=args.resume)
     distributed = comm.get_world_size() > 1
     if distributed:
         model = DistributedDataParallel(
