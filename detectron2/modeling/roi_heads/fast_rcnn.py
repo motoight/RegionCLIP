@@ -576,7 +576,7 @@ class FastRCNNOutputLayers(nn.Module):
             bg_score = self.cls_bg_score(normalized_x)
             if self.use_bias:
                 bg_score += self.cls_bg_score.bias
-            import ipdb; ipdb.set_trace()
+            # import ipdb; ipdb.set_trace()
             scores = torch.cat((cls_scores, bg_score), dim=1)
             assert torch.isfinite(scores).all(), 'nan in scores'
             scores = scores / self.temperature

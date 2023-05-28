@@ -36,6 +36,9 @@ MODEL.ROI_HEADS.SOFT_NMS_ENABLED True \
 
 
 
+
+
+
 # # RN50x4, COCO (Generalized: Novel + Base)
 # python3 ./tools/train_net.py \
 # --eval-only  \
